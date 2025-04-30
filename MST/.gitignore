@@ -1,0 +1,9 @@
+*.png
+*.out
+*out
+*.mtx
+*.txt
+*.zip
+build/*
+slurm*
+slurm_outs/*

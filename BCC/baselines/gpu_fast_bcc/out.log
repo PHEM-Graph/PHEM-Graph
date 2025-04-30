@@ -1,0 +1,30 @@
+
+Reading  file.
+
+========================================
+       Graph Properties & Execution Settings Overview
+========================================
+
+Graph reading and CSR creation completed in 107.014 ms
+|V|: -1
+|E|: 0
+maxThreadsPerBlock: 1024
+Verbose Mode: ❌
+Checker Enabled: ❌
+========================================
+
+
+Reading csr_bin file.
+
+========================================
+       Graph Properties & Execution Settings Overview
+========================================
+
+Graph reading and CSR creation completed in 106.308 ms
+|V|: -1
+|E|: 0
+maxThreadsPerBlock: 1024
+Verbose Mode: ❌
+Checker Enabled: ❌
+========================================
+
