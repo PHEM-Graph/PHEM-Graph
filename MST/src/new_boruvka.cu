@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -35,6 +34,7 @@
 #include <cstdio>
 #include <chrono> 
 #include "kernels.cu"
+#include "utils.cu"
 
 
 void boruvka_for_edge_array(edge* edges, vertex num_nodes, vertex num_edges,
@@ -194,7 +194,7 @@ void malloc_managed_monolithic(std::ifstream &input_stream, vertex num_nodes,
   assert(err == cudaSuccess);
 
   //populate the managed mem
-  populateEdgeArray(input_stream, d_edges, num_edges, num_nodes, generate_random_weights);
+  fastPopulateEdgeArray(input_stream, d_edges, num_edges, num_nodes, generate_random_weights);
 
   //Malloc a new edges array on device to be used in the iterative relabelling step on device
   edge *d_iter_edges;
@@ -323,91 +323,6 @@ void malloc_managed_monolithic(std::ifstream &input_stream, vertex num_nodes,
 }
 
 
-void cpu_boruvka_monolithic(std::string filename, bool generate_random_weights=false){
-
-  std::ifstream file(filename);
-  vertex num_nodes, num_edges, number_of_filled_edges;
-  large_vertex num_edges_large;
-  getGraphInfo(file, num_nodes, num_edges_large);
-  if(num_edges_large < sentinel_vertex){
-    num_edges = vertex(num_edges_large);
-  }
-  edge *edges_arr = (edge *)malloc(num_edges*sizeof(edge));
-  readGraph(edges_arr, num_nodes, num_edges, file, generate_random_weights);
-  std::vector<edge> edges(edges_arr, edges_arr + num_edges);
-
-  std::cout << "read the graph\n";
-  //Malloc three representative arrays
-  vertex* representative_array_arr = (vertex *)malloc(num_nodes*sizeof(vertex));
-  vertex* representative_array_iter_arr = (vertex *)malloc(num_nodes*sizeof(vertex));
-  std::vector<vertex> representative_array(representative_array_arr,
-                                  representative_array_arr+num_nodes);
-  std::vector<vertex> representative_array_iter(representative_array_iter_arr, 
-                                      representative_array_iter_arr+num_nodes);
-
-
-  //Malloc a copy of edges for iterations
-  edge* iter_edges_arr = (edge *)malloc(num_edges*sizeof(edge));
-  std::vector<edge> iter_edges(iter_edges_arr, iter_edges_arr+num_edges);
-  edge* iter_msf_arr = (edge *)malloc(num_nodes*sizeof(edge));
-  std::vector<edge> iter_msf(iter_msf_arr, iter_msf_arr+num_nodes);
-
-
-
-  edge *final_msf_arr = (edge *)malloc(num_nodes*sizeof(edge));
-  std::vector<edge> final_msf(final_msf_arr, final_msf_arr+num_nodes);
-
-
-  //Populate representative arrays
-  #pragma omp parallel for
-  for(vertex i=0; i<num_nodes; i++){
-    representative_array[i] = i;
-    representative_array_iter[i] = i;
-  }
-
-
-  //Malloc outgoing_edge_id array
-  outgoing_edge_id* outgoing_edges_arr = (outgoing_edge_id *)malloc(num_nodes*
-                                          sizeof(outgoing_edge_id));
-  std::vector<outgoing_edge_id> outgoing_edges(outgoing_edges_arr, outgoing_edges_arr+num_nodes);
-
-  std::cout << "in the method \n";
-
-  //Deep copy edges to iter_edges
-  std::cout << "\n";
-  #pragma omp parallel for
-  for(vertex i=0; i<num_edges; i++){
-    iter_edges[i].u = edges[i].u;
-    iter_edges[i].v = edges[i].v;
-    iter_edges[i].w = edges[i].w;
-  }
-
-
-
-
-  //for(int i=0; i<num_edges; i++){
-  //  std::cout << edges[i].u << " " << edges[i].v << " " << edges[i].w << std::endl;
-  //}
-  boruvka_for_edge_vector_cpu(edges, num_nodes, num_edges, 
-                          final_msf, number_of_filled_edges, representative_array,
-                          representative_array_iter, iter_edges, iter_msf, outgoing_edges);
-  
-  large_vertex w = 0;
-  for(vertex i=0; i<num_nodes-1;i++){
-    //std::cout << final_msf[i].u +1<< " " << final_msf[i].v+1 << " "
-    //  <<final_msf[i].w << "\n";
-    w += final_msf[i].w;
-  }
-  std::cout << "total weight " << w << "\n";
-
-  //Free mallocs
-  free(iter_msf_arr);
-  free(outgoing_edges_arr);
-  free(representative_array_arr);
-  free(representative_array_iter_arr);
-  free(iter_edges_arr);
-}
-
 float convertToFloat(int num) {
     return static_cast<float>(num) + 0.4f;
 }
@@ -424,8 +339,6 @@ void new_boruvka(std::string filename, std::string result_filename,
     vertex num_nodes = 0;
     large_vertex num_edges_large = 0;
 
-
-
     std::ifstream file(filename);
     cudaFree(0);
     getGraphInfo(file, num_nodes, num_edges_large);
@@ -441,7 +354,7 @@ void new_boruvka(std::string filename, std::string result_filename,
     }
 
     if(debug){
-      int debug_iters = 10;
+      int number_of_iterations = 10;
       std::cout << "chunk \n";
       if(use_cpu_gpu_streamline){
         std::cout << "streamline \n";
@@ -450,7 +363,7 @@ void new_boruvka(std::string filename, std::string result_filename,
           is_weight_float = true;
 
         streamline_boruvka_heterogeneous(file, num_nodes, num_edges_large, chunk_size, 
-                          result_filename, generate_random_weights, is_weight_float, debug_iters);
+                          result_filename, generate_random_weights, is_weight_float, number_of_iterations);
         std::cout << "debug " << debug << std::endl;
         return;
       }
@@ -460,10 +373,8 @@ void new_boruvka(std::string filename, std::string result_filename,
         if (filename.find("MOLIERE_2016") != std::string::npos) 
           is_weight_float = true;
 
-
-
         streamline_boruvka(file, num_nodes, num_edges_large, chunk_size, 
-                          result_filename, generate_random_weights, is_weight_float, debug_iters);
+                          result_filename, generate_random_weights, is_weight_float, number_of_iterations);
         std::cout << "debug " << debug << std::endl;
         return;
       }
@@ -481,7 +392,10 @@ void new_boruvka(std::string filename, std::string result_filename,
 
       edge *edges;
       cudaMallocHost((void**)&edges, num_edges * sizeof(edge));
-      ompPopulateEdgeArray(file, edges, num_edges, generate_random_weights);
+      
+      // Always use memory mapping for loading
+      mmapPopulateEdgeArray(filename, edges, num_edges, num_nodes, generate_random_weights);
+      
       if(save_weighted_graph){
         std::ofstream outgraph_weighted("weighted.mtx");
         outgraph_weighted << header_for_weighted_mtx;
@@ -493,9 +407,6 @@ void new_boruvka(std::string filename, std::string result_filename,
         }
         outgraph_weighted.close();
         return;
-        //for(vertex i=0; i<num_edges; i++){
-
-        //}
       }
 
       std::cout << "monolithic GPU approach\n";
@@ -503,17 +414,14 @@ void new_boruvka(std::string filename, std::string result_filename,
       boruvka_for_edge_array(edges, num_nodes, num_edges, msf, number_of_filled_edges, result_filename);
       weight total_weight=0;
       for(vertex i=0; i<num_nodes; i++){
-        edge e = msf[i];
+          edge e = msf[i];
         total_weight+=e.w;
-        //std::cout << e.u + 1 << " " << e.v + 1 << " " << e.w << std::endl;
       }
       std::cout << "Total weight " << total_weight << std::endl;
-
 
       //Free all allocs
       cudaFree(edges);
       cudaFree(msf);
-      //test_tbb();
 
       return;
     }
@@ -542,7 +450,6 @@ void new_boruvka(std::string filename, std::string result_filename,
     }
 
     edge *msf = (edge *)malloc(num_nodes*sizeof(edge));
-    //cudaMallocHost((void**)&msf, (num_nodes-1)* sizeof(edge));
     vertex number_of_filled_edges = 0;
 
     if(use_malloc_managed){
@@ -554,11 +461,12 @@ void new_boruvka(std::string filename, std::string result_filename,
 
     edge *edges;
     cudaMallocHost((void**)&edges, num_edges * sizeof(edge));
-    ompPopulateEdgeArray(file, edges, num_edges, num_nodes, generate_random_weights);
+    
+    // Always use memory mapping for loading
+    mmapPopulateEdgeArray(filename, edges, num_edges, num_nodes, generate_random_weights);
 
     if(use_cpu_only){
-      //cpu_boruvka_monolithic(filename, generate_random_weights);
-      edge_pbbs *edges_for_pbbs = (edge_pbbs *)malloc(num_edges_large*sizeof(edge));
+      edge_pbbs *edges_for_pbbs = (edge_pbbs *)malloc(num_edges_large*sizeof(edge_pbbs));
       for(large_vertex i=0;i<num_edges_large; i++){
         edges_for_pbbs[i].u = edges[i].u;
         edges_for_pbbs[i].v = edges[i].v;
@@ -583,7 +491,7 @@ void new_boruvka(std::string filename, std::string result_filename,
       return;
     }
 
-    std::cout << "monolithic1 GPU approach\n";
+    std::cout << "monolithic GPU approach\n";
     file.close();
 
     boruvka_for_edge_array(edges, num_nodes, num_edges, msf, number_of_filled_edges, result_filename);
@@ -593,7 +501,6 @@ void new_boruvka(std::string filename, std::string result_filename,
       total_weight+=e.w;
     }
     std::cout << "Total weight " << total_weight << std::endl;
-
 
     //Free all allocs
     cudaFree(edges);

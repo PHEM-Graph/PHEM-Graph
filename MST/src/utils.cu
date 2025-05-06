@@ -1,10 +1,13 @@
+#ifndef UTILS_CU
+#define UTILS_CU
+
 #include <cub/block/block_reduce.cuh>
 #include <cub/device/device_select.cuh>
 #include <cuda/atomic>
 #include <random>
 #include <stdlib.h>
 #include <omp.h>
-#include "constants.cpp"
+#include "constants.h"
 #include <execution>
 #define BLOCKSIZE 1024
 #include "parlay/sequence.h"
@@ -13,7 +16,12 @@
 #include "common/speculative_for.h"
 #include "common/get_time.h"
 #include "algorithm/union_find.h"
+#include "algorithm/kth_smallest.h"
 #include "MST.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 
 
@@ -149,17 +157,25 @@ vertex remove_self_loops(edge* d_edges, vertex num_edges, edge* d_edges_out){
     return h_num_selected_out;
 }
 
-void getGraphInfo(std::ifstream &file, vertex &num_nodes, large_vertex &num_edges_large){
-    std::string line;
-    //skip if line starts with %
-    while(std::getline(file, line)){
-        if(line[0] != '%')
-            break;
+void getGraphInfo(std::ifstream &file, vertex &num_nodes, large_vertex &num_edges_large) {
+  std::string line;
+  // Skip comments
+  while (std::getline(file, line)) {
+    if (line[0] != '%') break;
+  }
+  
+  std::stringstream ss(line);
+  vertex tmp;
+  ss >> num_nodes >> tmp >> num_edges_large;
+  
+  // Reset file position if needed
+  if (file.tellg() != std::streampos(-1)) {
+    file.seekg(0, std::ios::beg);
+    // Skip comments again
+    while (std::getline(file, line)) {
+      if (line[0] != '%') break;
     }
-    std::stringstream ss(line);
-    vertex tmp;
-    ss >> num_nodes >> tmp >> num_edges_large;
-    std::cout << "num nodes " << num_nodes << std::endl;
+  }
 }
 
 
@@ -206,6 +222,48 @@ void ompPopulateEdgeArray(std::ifstream &file, edge *edges, vertex num_edges, ve
   return;
 }
 
+void fastPopulateEdgeArray(std::ifstream &file, edge *edges, vertex num_edges, vertex num_nodes, bool generate_random_weights=false) {
+  // Read all lines into memory first
+  std::vector<std::string> lines(num_edges);
+  
+  #pragma omp parallel
+  {
+    // Each thread reads a chunk of the file
+    #pragma omp for schedule(dynamic, 1024)
+    for (vertex i = 0; i < num_edges; i++) {
+      std::string line;
+      #pragma omp critical
+      {
+        std::getline(file, line);
+      }
+      lines[i] = line;
+    }
+    
+    // Now parse the lines in parallel
+    #pragma omp for schedule(dynamic, 1024)
+    for (vertex i = 0; i < num_edges; i++) {
+      vertex u, v;
+      weight w;
+      std::stringstream ss(lines[i]);
+      
+      if (generate_random_weights) {
+        ss >> u >> v;
+        w = ((u-1)*(v-1)%num_nodes) + 1;
+      } else {
+        ss >> u >> v >> w;
+      }
+      
+      edges[i].u = u - 1;
+      edges[i].v = v - 1;
+      edges[i].w = w;
+    }
+  }
+  
+  // Clear the vector to free memory
+  lines.clear();
+  lines.shrink_to_fit();
+}
+
 void populateEdgeArray(std::ifstream &file, edge *edges, vertex num_edges, vertex num_nodes
                        ,bool generate_random_weights = false){
 
@@ -242,95 +300,250 @@ void populateEdgeArray(std::ifstream &file, edge *edges, vertex num_edges, verte
 void populateEdgeChunksLarge(std::ifstream &file, edge **chunks_of_edges, large_vertex num_edges, vertex num_nodes,
                         vertex chunk_size, vertex last_chunk_size, int num_chunks,
                         bool generate_random_weights=false, bool is_weight_float=false){
-    std::string line;
-    vertex u, v;
-    weight w;
-    weight w_discard;
-    if(generate_random_weights && !is_weight_float){
-      std::cout << "generating random weights 10\n";
-      for(vertex i = 0; i < num_chunks-1; i++){
-        for(vertex j = 0; j < chunk_size; j++){
-          std::getline(file, line);
-          std::stringstream ss(line);
-          ss >> u >> v;
-          chunks_of_edges[i][j].u = u - 1;
-          chunks_of_edges[i][j].v = v - 1;
-          //w = (hash_weight(v)%10) + 1;
-      	  w = ((u-1)*(v-1)%num_nodes) + 1;
-          chunks_of_edges[i][j].w = w;
-          //if((i*chunk_size+j)%100000 == 0){
-          //  double prog = double(i*chunk_size+j) / num_edges;
-          //  printProgress(prog);
-          //}
-        }
-      }
-      for(vertex j = 0; j < last_chunk_size; j++){
-        std::getline(file, line);
-        std::stringstream ss(line);
-        ss >> u >> v;
-        chunks_of_edges[num_chunks-1][j].u = u - 1;
-        chunks_of_edges[num_chunks-1][j].v = v - 1;
-        //w = (hash_weight(v)%10) + 1;
-        w = ((u-1)*(v-1)%num_nodes) + 1;
-        chunks_of_edges[num_chunks-1][j].w = w;
-      }
+    std::cout << "Starting memory-mapped file loading for edge chunks..." << std::endl;
+    
+    // We need to get the filename from the file stream
+    // Since we can't directly get it, we'll need to use a temporary file
+    std::string temp_filename = "temp_mmap_file.txt";
+    
+    // Save current position in the file
+    std::streampos current_pos = file.tellg();
+    
+    // Rewind to beginning
+    file.seekg(0, std::ios::beg);
+    
+    // Create a temporary file with the same content
+    std::ofstream temp_file(temp_filename, std::ios::binary);
+    if (!temp_file) {
+        std::cerr << "Error creating temporary file for memory mapping" << std::endl;
+        return;
     }
-    if(generate_random_weights && is_weight_float){
-      std::cout << "discarding float weights\n";
-      for(vertex i = 0; i < num_chunks-1; i++){
-        for(vertex j = 0; j < chunk_size; j++){
-          std::getline(file, line);
-          std::stringstream ss(line);
-          ss >> u >> v >> w_discard;
-          chunks_of_edges[i][j].u = u - 1;
-          chunks_of_edges[i][j].v = v - 1;
-          //w = (hash_weight(v)%10) + 1;
-          w = ((u-1)*(v-1)%num_nodes) + 1;
-          chunks_of_edges[i][j].w = w;
-          //if((i*chunk_size+j)%100000 == 0){
-          //  double prog = double(i*chunk_size+j) / num_edges;
-          //  printProgress(prog);
-          //}
-        }
-      }
-      for(vertex j = 0; j < last_chunk_size; j++){
-        std::getline(file, line);
-        std::stringstream ss(line);
-        ss >> u >> v;
-        chunks_of_edges[num_chunks-1][j].u = u - 1;
-        chunks_of_edges[num_chunks-1][j].v = v - 1;
-        //w = (hash_weight(v)%10) + 1;
-        w = ((u-1)*(v-1)%num_nodes) + 1;
-        chunks_of_edges[num_chunks-1][j].w = w;
-      }
-
+    
+    // Copy content
+    temp_file << file.rdbuf();
+    temp_file.close();
+    
+    // Restore original position
+    file.seekg(current_pos);
+    
+    // Now open the temporary file for memory mapping
+    int fd = open(temp_filename.c_str(), O_RDONLY);
+    if (fd == -1) {
+        std::cerr << "Error opening temporary file for memory mapping: " << strerror(errno) << std::endl;
+        return;
     }
-    if(!generate_random_weights){
-      for(vertex i = 0; i < num_chunks-1; i++){
-        for(vertex j = 0; j < chunk_size; j++){
-          std::getline(file, line);
-          std::stringstream ss(line);
-          ss >> u >> v >> w;
-          chunks_of_edges[i][j].u = u - 1;
-          chunks_of_edges[i][j].v = v - 1;
-          chunks_of_edges[i][j].w = w;
-          //if((i*chunk_size+j)%100000 == 0){
-          //  double prog = (i*chunk_size+j)/num_edges;
-          //  printProgress(prog);
-          //}
-        }
-      }
-      for(vertex j = 0; j < last_chunk_size; j++){
-        std::getline(file, line);
-        std::stringstream ss(line);
-        ss >> u >> v >> w;
-        chunks_of_edges[num_chunks-1][j].u = u - 1;
-        chunks_of_edges[num_chunks-1][j].v = v - 1;
-        chunks_of_edges[num_chunks-1][j].w = w;
-      }
-
+    
+    // Get file size
+    struct stat sb;
+    if (fstat(fd, &sb) == -1) {
+        std::cerr << "Error getting file stats: " << strerror(errno) << std::endl;
+        close(fd);
+        return;
     }
-
+    
+    // Map the file into memory
+    char* file_data = (char*)mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file_data == MAP_FAILED) {
+        std::cerr << "Error memory mapping file: " << strerror(errno) << std::endl;
+        close(fd);
+        return;
+    }
+    
+    std::cout << "File mapped successfully, size: " << sb.st_size << " bytes" << std::endl;
+    std::cout << "Processing " << num_edges << " edges for " << num_nodes << " nodes" << std::endl;
+    
+    // Find the start of the data (after header comments and dimensions line)
+    char* data_start = file_data;
+    char* file_end = file_data + sb.st_size;
+    
+    // Skip comment lines (starting with %)
+    while (data_start < file_end && *data_start == '%') {
+        // Skip to end of line
+        while (data_start < file_end && *data_start != '\n') {
+            data_start++;
+        }
+        // Skip the newline character
+        if (data_start < file_end) data_start++;
+    }
+    
+    // Skip the dimensions line (first non-comment line)
+    while (data_start < file_end && *data_start != '\n') {
+        data_start++;
+    }
+    if (data_start < file_end) data_start++; // Skip the newline
+    
+    std::cout << "Header skipped, starting to process edge chunks" << std::endl;
+    
+    // Count the number of newlines to determine line positions
+    std::vector<char*> line_starts;
+    line_starts.reserve(num_edges);
+    
+    char* current = data_start;
+    line_starts.push_back(current);
+    
+    while (current < file_end) {
+        if (*current == '\n') {
+            if (current + 1 < file_end) {
+                line_starts.push_back(current + 1);
+            }
+        }
+        current++;
+    }
+    
+    // Make sure we don't try to process more lines than we have
+    size_t actual_lines = std::min(line_starts.size(), static_cast<size_t>(num_edges));
+    
+    std::cout << "Found " << actual_lines << " data lines" << std::endl;
+    
+    // Process the edge data in parallel for each chunk
+    #pragma omp parallel
+    {
+        // Process each chunk
+        #pragma omp for schedule(dynamic, 1)
+        for (int chunk_idx = 0; chunk_idx < num_chunks - 1; chunk_idx++) {
+            vertex chunk_start = chunk_idx * chunk_size;
+            
+            // Process each edge in the chunk
+            #pragma omp parallel for schedule(dynamic, 1024)
+            for (vertex i = 0; i < chunk_size; i++) {
+                large_vertex edge_idx = chunk_start + i;
+                if (edge_idx >= actual_lines) continue;
+                
+                char* line = line_starts[edge_idx];
+                char* next_line = (edge_idx < line_starts.size() - 1) ? line_starts[edge_idx + 1] : file_end;
+                size_t line_length = next_line - line - 1; // -1 to exclude newline
+                
+                // Skip empty lines
+                if (line_length <= 0) continue;
+                
+                // Parse the line
+                vertex u = 0, v = 0;
+                weight w = 0;
+                
+                // Parse u
+                while (line < next_line && (*line == ' ' || *line == '\t')) line++; // Skip leading whitespace
+                while (line < next_line && *line >= '0' && *line <= '9') {
+                    u = u * 10 + (*line - '0');
+                    line++;
+                }
+                
+                // Skip whitespace
+                while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                
+                // Parse v
+                while (line < next_line && *line >= '0' && *line <= '9') {
+                    v = v * 10 + (*line - '0');
+                    line++;
+                }
+                
+                // Parse or generate w
+                if (generate_random_weights && !is_weight_float) {
+                    w = ((u-1)*(v-1)%num_nodes) + 1;
+                } else if (generate_random_weights && is_weight_float) {
+                    // Skip whitespace to discard float weight
+                    while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                    
+                    // Skip over the float value
+                    while (line < next_line && ((*line >= '0' && *line <= '9') || *line == '.' || *line == 'e' || *line == 'E' || *line == '+' || *line == '-')) {
+                        line++;
+                    }
+                    
+                    w = ((u-1)*(v-1)%num_nodes) + 1;
+                } else {
+                    // Skip whitespace
+                    while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                    
+                    // Parse w
+                    while (line < next_line && *line >= '0' && *line <= '9') {
+                        w = w * 10 + (*line - '0');
+                        line++;
+                    }
+                }
+                
+                // Store the edge
+                chunks_of_edges[chunk_idx][i].u = u - 1;
+                chunks_of_edges[chunk_idx][i].v = v - 1;
+                chunks_of_edges[chunk_idx][i].w = w;
+            }
+        }
+        
+        // Process the last chunk separately (it might have a different size)
+        #pragma omp single
+        {
+            vertex chunk_start = (num_chunks - 1) * chunk_size;
+            
+            #pragma omp parallel for schedule(dynamic, 1024)
+            for (vertex i = 0; i < last_chunk_size; i++) {
+                large_vertex edge_idx = chunk_start + i;
+                if (edge_idx >= actual_lines) continue;
+                
+                char* line = line_starts[edge_idx];
+                char* next_line = (edge_idx < line_starts.size() - 1) ? line_starts[edge_idx + 1] : file_end;
+                size_t line_length = next_line - line - 1; // -1 to exclude newline
+                
+                // Skip empty lines
+                if (line_length <= 0) continue;
+                
+                // Parse the line
+                vertex u = 0, v = 0;
+                weight w = 0;
+                
+                // Parse u
+                while (line < next_line && (*line == ' ' || *line == '\t')) line++; // Skip leading whitespace
+                while (line < next_line && *line >= '0' && *line <= '9') {
+                    u = u * 10 + (*line - '0');
+                    line++;
+                }
+                
+                // Skip whitespace
+                while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                
+                // Parse v
+                while (line < next_line && *line >= '0' && *line <= '9') {
+                    v = v * 10 + (*line - '0');
+                    line++;
+                }
+                
+                // Parse or generate w
+                if (generate_random_weights && !is_weight_float) {
+                    w = ((u-1)*(v-1)%num_nodes) + 1;
+                } else if (generate_random_weights && is_weight_float) {
+                    // Skip whitespace to discard float weight
+                    while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                    
+                    // Skip over the float value
+                    while (line < next_line && ((*line >= '0' && *line <= '9') || *line == '.' || *line == 'e' || *line == 'E' || *line == '+' || *line == '-')) {
+                        line++;
+                    }
+                    
+                    w = ((u-1)*(v-1)%num_nodes) + 1;
+                } else {
+                    // Skip whitespace
+                    while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                    
+                    // Parse w
+                    while (line < next_line && *line >= '0' && *line <= '9') {
+                        w = w * 10 + (*line - '0');
+                        line++;
+                    }
+                }
+                
+                // Store the edge
+                chunks_of_edges[num_chunks-1][i].u = u - 1;
+                chunks_of_edges[num_chunks-1][i].v = v - 1;
+                chunks_of_edges[num_chunks-1][i].w = w;
+            }
+        }
+    }
+    
+    // Clean up
+    munmap(file_data, sb.st_size);
+    close(fd);
+    
+    // Remove the temporary file
+    std::remove(temp_filename.c_str());
+    
+    std::cout << "Memory-mapped file processing for edge chunks complete" << std::endl;
 }
 
 void populateEdgeChunks(std::ifstream &file, edge **chunks_of_edges, vertex num_edges, vertex num_nodes,
@@ -506,50 +719,6 @@ void readGraph(edge* edges, vertex num_nodes, vertex num_edges,
 
 }
 
-
-
-
-
-
-
-void reset_edge_array_to_sentinel_cpu(std::vector<edge> &edges, vertex num_edges){
-  #pragma omp parallel for num_threads(40)
-  for(vertex i=0; i<num_edges;i++){
-    edges[i].u = sentinel_vertex;
-    edges[i].v = sentinel_vertex;
-    edges[i].w = sentinel;
-  }
-}
-
-void reset_outgoing_edge_array_cpu(std::vector<outgoing_edge_id> &outgoing_edges,
-                                   vertex num_nodes, vertex num_edges){
-  #pragma omp parallel for num_threads(40)
-  for(vertex i=0; i<num_nodes; i++){
-    outgoing_edges[i].e_id = num_edges +1;
-    outgoing_edges[i].w = sentinel;
-  }
-}
-
-void copy_representative_arrays_cpu(std::vector<vertex> &representative, std::vector<vertex> &iter_representatives,
-                                vertex num_nodes){
-  #pragma omp parallel for num_threads(40)
-  for(vertex i=0; i<num_nodes; i++){
-    representative[i] = iter_representatives[i];
-  }
-}
-
-
-
-//Function to check if two edges are the same
-void check_if_edges_are_same_cpu(edge a, edge b, bool *same){
-    if(a.u == b.u && a.v == b.v && a.w == b.w){
-        *same = true;
-    }else{
-        *same = false;
-    }
-}
-
-
 bool check_if_edge_weight_is_not_sentinel(edge e){
   if(e.w != sentinel)
     return true;
@@ -563,528 +732,6 @@ bool is_not_self_edge(const edge &e){
 }
 
 
-void atomic_min_weight_cpu(outgoing_edge_id *existing_id, weight new_weight){
-    if(existing_id->w > new_weight){
-      existing_id->w = new_weight;
-    }
-  return;
-}
-
-void atomic_min_eid_cpu(outgoing_edge_id *existing_id, vertex new_eid){
-  //#pragma omp atomic
-    if(existing_id->e_id > new_eid){
-      existing_id->e_id = new_eid;
-    }
-  return;
-}
-
-void populate_min_weight_cpu(std::vector<edge> &edges,
-                            std::vector<outgoing_edge_id> &best_index,
-                            vertex num_edges, vertex num_nodes){
-  #pragma omp parallel for num_threads(40)
-  for(int i=0; i<num_edges; i++){
-    edge tid_e = edges[i];
-    vertex tid_u = tid_e.u;
-    vertex tid_v = tid_e.v;
-    weight tid_w = tid_e.w;
-    if(tid_u != tid_v){
-      if(best_index[tid_u].w > tid_w){
-        vertex oldValue = 0;
-        do {
-          oldValue = best_index[tid_u].w;
-        } while (!__sync_bool_compare_and_swap(&best_index[tid_u].w, oldValue, std::min(oldValue, tid_w)));
-
-        //#pragma omp atomic write
-        //best_index[tid_u].w = std::min(best_index[tid_u].w, tid_w);
-      }
-      //other vertex
-      if(best_index[tid_v].w > tid_w){
-        vertex oldValue1 = 0;
-        do {
-          oldValue1 = best_index[tid_v].w;
-        } while (!__sync_bool_compare_and_swap(&best_index[tid_v].w, oldValue1, std::min(oldValue1, tid_w)));
-
-        //#pragma omp atomic write
-        //best_index[tid_v].w = std::min(best_index[tid_v].w, tid_w);
-        //best_index[tid_v].w = tid_w;
-      }
-    }
-  }
-}
-
-void populate_eid_cpu(std::vector<edge> &edges,
-                  std::vector<outgoing_edge_id> &best_index,
-                  vertex num_edges, vertex num_nodes){
-  #pragma omp parallel for num_threads(40)
-  for(vertex i=0; i<num_edges; i++){
-    edge tid_e = edges[i];
-    vertex tid_u = tid_e.u;
-    vertex tid_v = tid_e.v;
-    if(tid_u != tid_v){
-      weight tid_w = tid_e.w;
-      weight u_best_w = best_index[tid_u].w;
-      weight v_best_w = best_index[tid_v].w;
-      if(tid_w == u_best_w){
-        //atomic_min_eid_cpu(&best_index[tid_u], i);
-        //#pragma omp atomic write
-        //best_index[tid_u].e_id = i;
-
-
-        vertex oldValue = 0;
-        do {
-          oldValue = best_index[tid_u].e_id;
-        } while (!__sync_bool_compare_and_swap(&best_index[tid_u].e_id, oldValue, std::min(oldValue, i)));
-
-
-
-      }
-      if(tid_w == v_best_w){
-        //atomic_min_eid_cpu(&best_index[tid_v], i);
-        //#pragma omp atomic write
-        //best_index[tid_v].e_id = i;
-
-        vertex oldValue = 0;
-        do {
-          oldValue = best_index[tid_v].e_id;
-        } while (!__sync_bool_compare_and_swap(&best_index[tid_v].e_id, oldValue, std::min(oldValue, i)));
-
-
-      }
-    }
-  }
-
-
-
-  return;
-}
-
-
-void grafting_edges_cpu(std::vector<outgoing_edge_id> &outgoing_edges,
-                        std::vector<edge> &iter_edges, std::vector<edge> &edges,
-                        std::vector<edge> &msf, std::vector<vertex> &representative,
-                        vertex num_nodes, vertex num_edges){
-  #pragma omp parallel for num_threads(40)
-  for(int i=0; i<num_nodes; i++){
-    outgoing_edge_id tid_outgoing_edge_id = outgoing_edges[i];
-    vertex tid_outgoing_e_id = tid_outgoing_edge_id.e_id;
-    //weight tid_best_w = tid_outgoing_edge_id.w;
-    if(tid_outgoing_e_id < (num_edges) ){
-      edge tid_best = iter_edges[tid_outgoing_e_id];
-      vertex u = tid_best.u;
-      vertex v = tid_best.v;
-      if(tid_best.u != sentinel_vertex && u != v){
-        edge corresponding_edge_in_edges = edges[tid_outgoing_e_id];
-        vertex tid_best_u, tid_best_v;
-        vertex corresponding_u, corresponding_v;
-        weight corresponding_w;
-        corresponding_u = corresponding_edge_in_edges.u;
-        corresponding_w = corresponding_edge_in_edges.w;
-        if(corresponding_u != sentinel_vertex && corresponding_w != sentinel){
-          corresponding_v = corresponding_edge_in_edges.v;
-          if(tid_best.u == i){
-            tid_best_u = tid_best.u;
-            tid_best_v = tid_best.v;
-          }else{
-            tid_best_u = tid_best.v;
-            tid_best_v = tid_best.u;
-          }
-          // This ensures that tid_best_u == tid
-
-          //find the best outgoing edge for tid_best_v
-          outgoing_edge_id best_outgoing_edge_of_v = outgoing_edges[tid_best_v];
-          vertex best_outgoing_edge_of_v_e_id = best_outgoing_edge_of_v.e_id;
-          edge best_outgoing_edge_of_v_edge = iter_edges[best_outgoing_edge_of_v_e_id];
-          //check if tid_best and best_outgoing_edge_of_v are the same
-          bool same = false;
-          check_if_edges_are_same_cpu(tid_best, best_outgoing_edge_of_v_edge, &same);
-          if(same && (tid_best_u < tid_best_v)){
-            msf[i].w = sentinel;
-          }
-          else if(same && (tid_best_u > tid_best_v)){
-          //else if((tid_best_u > tid_best_v)){
-            representative[i] = tid_best_v;
-            msf[i].u = corresponding_u;
-            msf[i].v = corresponding_v;
-            msf[i].w = corresponding_w;
-          }
-          else if(!same){
-            representative[i] = tid_best_v;
-            msf[i].u = corresponding_u;
-            msf[i].v = corresponding_v;
-            msf[i].w = corresponding_w;
-          }
-        }
-      }
-    }
-    else{
-      //d_representative[tid] = -1;
-      msf[i].w = sentinel;
-    }
-  }
-  return;
-}
-
-
-
-void shortcutting_step_cpu(std::vector<vertex> &representative,
-                vertex num_nodes, weight sentinel, std::vector<vertex> &iter_representatives){
-  #pragma omp parallel for num_threads(40)
-  for(int i=0; i<num_nodes; i++){
-    //Find the root of each tid. Break when root is found 
-    vertex r = i;
-    vertex root = representative[r];
-    while(true){
-      if(root == representative[root]){
-        break;
-      }
-      root = representative[root];
-    }
-    //Set the representative of each tid to the root
-    iter_representatives[i] = root;
-  }
-  return;
-}
-
-void relabelling_step_cpu(std::vector<edge> &edges, std::vector<vertex> &representative,
-                      vertex num_edges, vertex num_nodes){
-  #pragma omp parallel for num_threads(40)
-  for(vertex i=0; i<num_edges; i++){
-    vertex u = edges[i].u;
-    vertex v = edges[i].v;
-    //if(u == v){
-    //  edges[i].w = sentinel;
-    //}
-    if(u != sentinel_vertex && u != v){
-      if(u < num_nodes && v < num_nodes){
-        vertex new_u = representative[u];
-        vertex new_v = representative[v];
-        if(edges[i].u != sentinel_vertex){
-          edges[i].u = new_u;
-          edges[i].v = new_v;
-        }
-      }
-      else{
-        edges[i].u = sentinel_vertex;
-        edges[i].v = sentinel_vertex;
-        edges[i].w = sentinel;
-      }
-    }
-  }
-}
-
-
-void filtering_step_cpu(std::vector<edge> &new_edges, std::vector<vertex> &representative,
-                    vertex num_edges, vertex num_nodes){
-
-  #pragma omp parallel for num_threads(40)
-  for(vertex i=0; i<num_edges; i++){
-    vertex u = new_edges[i].u;
-    weight w = new_edges[i].w;
-    if(u != sentinel_vertex && w != sentinel){
-      vertex v = new_edges[i].v;
-      if(u<num_nodes && v<num_nodes){
-        if(representative[u] != representative[v]){
-          new_edges[i].u = u;
-          new_edges[i].v = v;
-          new_edges[i].w = new_edges[i].w;
-        }else{
-          new_edges[i].u = sentinel_vertex;
-          new_edges[i].v = sentinel_vertex;
-          new_edges[i].w = sentinel;
-        }
-      }
-    }
-  }
-}
-
-
-
-void boruvka_for_edge_vector_cpu(std::vector<edge> edges, vertex num_nodes,
-                                vertex num_edges, std::vector<edge> &final_msf,
-                                vertex &number_of_filled_edges,
-                                std::vector<vertex> representative_array,     
-                                std::vector<vertex> representative_array_iter,     
-                                std::vector<edge> iter_edges, std::vector<edge> iter_msf,
-                                std::vector<outgoing_edge_id> outgoing_edges,
-                                std::string result = "res.txt"){
-  //print the graph params
-  std::cout << "num nodes " << num_nodes << std::endl;
-  std::cout << "num_edges " << num_edges << std::endl;
-
-  int iter = 0;
-  vertex offset_msf = 0;
-
-
-  auto start_cpu = std::chrono::high_resolution_clock::now();
-  while(true){
-    std::cout << "iter " << iter << std::endl;
-
-    //reset msf array to sentinel
-    reset_edge_array_to_sentinel_cpu(iter_msf, num_nodes);
-    //reset outgoing edges array
-    reset_outgoing_edge_array_cpu(outgoing_edges, num_nodes, num_edges);
-    std::cout << "done reset\n";
-
-    //min weight finding step
-    populate_min_weight_cpu(iter_edges,
-                            outgoing_edges,
-                            num_edges, num_nodes);
-
-    std::cout << "done populate min weight\n";
-    //populate e_id
-    populate_eid_cpu(iter_edges, outgoing_edges,
-                    num_edges, num_nodes);
-
-    std::cout << iter <<  "\n";
-    //grafting edges
-    std::cout << "grafting edges \n";
-    grafting_edges_cpu(outgoing_edges,
-                      iter_edges, edges,
-                      iter_msf, representative_array,
-                      num_nodes, num_edges);
-    std::cout << "grafted edges \n";
-    std::cout << "\n";
-
-    //find number of edges in msf where edge weight is not sentinel
-
-    vertex candidate_edges = std::count_if(std::execution::par, iter_msf.begin(), iter_msf.begin()+num_nodes, 
-                              check_if_edge_weight_is_not_sentinel);
-
-    std::cout << "counted \n";
-
-    std::copy_if(std::execution::par, iter_msf.begin(), iter_msf.end(), final_msf.begin()+offset_msf, 
-                check_if_edge_weight_is_not_sentinel);
-    std::cout << "offset " << offset_msf<<std::endl;
-    std::cout << "candidate_edges " << candidate_edges << std::endl;
-    std::cout << "completed copy \n";
-
-    offset_msf += candidate_edges;
-
-    //shortcutting_step_cpu
-    shortcutting_step_cpu(representative_array,
-                num_nodes, sentinel, representative_array_iter);
-    std::cout << "completed shortcut \n";
-
-
-    //copy representative_array_iter to representative_array
-    copy_representative_arrays_cpu(representative_array, representative_array_iter,
-                               num_nodes);
-    std::cout << "completed copy \n";
-
-    //Relabelling steps
-    relabelling_step_cpu(iter_edges, representative_array, num_edges, num_nodes);
-    std::cout << "completed relabelling\n";
-
-    //filtering steps for edges
-    filtering_step_cpu(edges, representative_array, num_edges, num_nodes);
-    std::cout << "completed filtering\n";
-
-    //Remove edges in 'edges' where edge weight is sentinel
-    //convert edges array to std::vector
-    //std::vector<edge> edges_vector(edges, edges+num_edges);
-    //std::vector<edge> iter_edges_vector(iter_edges, iter_edges+num_edges);
-
-    //parallel_remove_if(edges, num_edges, num_nodes);
-    //std::remove_if(std::execution::par, edges.begin(), 
-    //                edges.begin()+num_edges, [](edge e){ 
-    //                return e.w == sentinel;});
-    std::cout << "completed remove1 \n";
-    
-    //Remove self loop edges in 'iter_edges'
-    //auto iter_edges_start(iter_edges);
-    
-
-    //std::remove_if(std::execution::par, iter_edges.begin(), 
-    //               iter_edges.begin()+num_edges, [](edge e){return e.u == e.v;});
-    //std::cout << "completed remove2 \n";
-
-    vertex new_num_edges=1;
-    auto does_non_self_exist = std::find_if(std::execution::par, iter_edges.begin(),
-                                        iter_edges.end(), 
-                                        is_not_self_edge);
-    if(does_non_self_exist == iter_edges.end()){
-      std::cout << "no more self edges\n";
-      new_num_edges =0;
-    }
-    std::cout << "INDEX of same edges " << std::distance(iter_edges.begin(), does_non_self_exist) << "\n";
-
-    std::cout << "completed counting new num edges\n";
-
-
-    //for(int i=0; i<num_edges; i++){
-    //  std::cout << iter_edges[i].u << " " << iter_edges[i].v << "\n";
-    //}
-    std::cout << "Number of non self edges  "  << new_num_edges << "\n";
-
-    //update num_edges
-    //num_edges = new_num_edges;
-  
-    std::cout << "NEW NUM EDGES " << num_edges << "\n";
-    if(new_num_edges == 0){
-      std::cout << "done in " << iter << " iterations \n";
-      std::cout << "filled " << offset_msf << " edges \n";
-      number_of_filled_edges = offset_msf;
-      break;
-    }
-
-    iter++;
-    if(iter == 50){
-      break;
-    }
-
-  }
-  auto stop_cpu = std::chrono::high_resolution_clock::now();
-  auto duration_cpu = std::chrono::duration_cast<std::chrono::microseconds>(
-                      stop_cpu-start_cpu);
-  std::cout << "Time to execute " << duration_cpu.count() << " microseconds"<< std::endl;
-
-  //free(iter_edges);
-
-}
-
-
-void boruvka_for_edge_vector_cpu_with_remove_if(std::vector<edge> edges, vertex num_nodes,
-                                vertex num_edges, std::vector<edge> &final_msf,
-                                vertex &number_of_filled_edges,
-                                std::vector<vertex> representative_array,     
-                                std::vector<vertex> representative_array_iter,     
-                                std::vector<edge> iter_edges, std::vector<edge> iter_msf,
-                                std::vector<outgoing_edge_id> outgoing_edges,
-                                std::string result = "res.txt"){
-  //print the graph params
-  std::cout << "num nodes " << num_nodes << std::endl;
-  std::cout << "num_edges " << num_edges << std::endl;
-
-  int iter = 0;
-  vertex offset_msf = 0;
-
-
-  auto start_cpu = std::chrono::high_resolution_clock::now();
-  while(true){
-    std::cout << "iter " << iter << std::endl;
-
-    //reset msf array to sentinel
-    reset_edge_array_to_sentinel_cpu(iter_msf, num_nodes);
-    //reset outgoing edges array
-    reset_outgoing_edge_array_cpu(outgoing_edges, num_nodes, num_edges);
-    std::cout << "done reset\n";
-
-    //min weight finding step
-    populate_min_weight_cpu(iter_edges,
-                            outgoing_edges,
-                            num_edges, num_nodes);
-
-    std::cout << "done populate min weight\n";
-    //populate e_id
-    populate_eid_cpu(iter_edges, outgoing_edges,
-                    num_edges, num_nodes);
-
-    std::cout << iter <<  "\n";
-    //grafting edges
-    std::cout << "grafting edges \n";
-    grafting_edges_cpu(outgoing_edges,
-                      iter_edges, edges,
-                      iter_msf, representative_array,
-                      num_nodes, num_edges);
-    std::cout << "grafted edges \n";
-    std::cout << "\n";
-
-    //find number of edges in msf where edge weight is not sentinel
-
-    vertex candidate_edges = std::count_if(std::execution::par, iter_msf.begin(), iter_msf.begin()+num_nodes, 
-                              check_if_edge_weight_is_not_sentinel);
-
-    std::cout << "counted \n";
-
-    std::copy_if(std::execution::par, iter_msf.begin(), iter_msf.end(), final_msf.begin()+offset_msf, 
-                check_if_edge_weight_is_not_sentinel);
-    std::cout << "offset " << offset_msf<<std::endl;
-    std::cout << "candidate_edges " << candidate_edges << std::endl;
-    std::cout << "completed copy \n";
-
-    offset_msf += candidate_edges;
-
-    //shortcutting_step_cpu
-    shortcutting_step_cpu(representative_array,
-                num_nodes, sentinel, representative_array_iter);
-    std::cout << "completed shortcut \n";
-
-
-    //copy representative_array_iter to representative_array
-    copy_representative_arrays_cpu(representative_array, representative_array_iter,
-                               num_nodes);
-    std::cout << "completed copy \n";
-
-    //Relabelling steps
-    relabelling_step_cpu(iter_edges, representative_array, num_edges, num_nodes);
-    std::cout << "completed relabelling\n";
-
-    //filtering steps for edges
-    filtering_step_cpu(edges, representative_array, num_edges, num_nodes);
-    std::cout << "completed filtering\n";
-
-    //Remove edges in 'edges' where edge weight is sentinel
-    //convert edges array to std::vector
-
-    std::remove_if(std::execution::par, edges.begin(), 
-                    edges.begin()+num_edges, [](edge e){ 
-                    return e.w == sentinel;});
-    std::cout << "completed remove1 \n";
-    
-    //Remove self loop edges in 'iter_edges'
-    //auto iter_edges_start(iter_edges);
-    
-
-    //std::remove_if(std::execution::par, iter_edges.begin(), 
-    //               iter_edges.begin()+num_edges, [](edge e){return e.u == e.v;});
-    //std::cout << "completed remove2 \n";
-
-    //vertex new_num_edges=1;
-    //auto does_non_self_exist = std::find_if(std::execution::par, iter_edges.begin(),
-    //                                    iter_edges.end(), 
-    //                                    is_not_self_edge);
-    //if(does_non_self_exist == iter_edges.end()){
-    //  std::cout << "no more self edges\n";
-    //  new_num_edges =0;
-    //}
-    //std::cout << "INDEX of same edges " << std::distance(iter_edges.begin(), does_non_self_exist) << "\n";
-
-    vertex new_num_edges = std::count_if(std::execution::par, iter_edges.begin(),
-                                        iter_edges.begin()+num_edges, [](edge e){return e.u != e.v;});
-    std::cout << "completed counting new num edges\n";
-
-
-    //for(int i=0; i<num_edges; i++){
-    //  std::cout << iter_edges[i].u << " " << iter_edges[i].v << "\n";
-    //}
-    std::cout << "Number of non self edges  "  << new_num_edges << "\n";
-
-    //update num_edges
-    num_edges = new_num_edges;
-  
-    std::cout << "NEW NUM EDGES " << num_edges << "\n";
-    if(new_num_edges == 0){
-      std::cout << "done in " << iter << " iterations \n";
-      std::cout << "filled " << offset_msf << " edges \n";
-      number_of_filled_edges = offset_msf;
-      break;
-    }
-
-    iter++;
-    if(iter == 50){
-      break;
-    }
-
-  }
-  auto stop_cpu = std::chrono::high_resolution_clock::now();
-  auto duration_cpu = std::chrono::duration_cast<std::chrono::microseconds>(
-                      stop_cpu-start_cpu);
-  std::cout << "Time to execute " << duration_cpu.count() << " microseconds"<< std::endl;
-
-  //free(iter_edges);
-
-}
-
 void kruskal_for_edge_vector_cpu(std::vector<edge> edges,
                                  std::vector<edge> &final_msf,
                                  DSU s, vertex number_of_filled_edges){
@@ -1096,16 +743,6 @@ std::string header_for_weighted_mtx = R"(%%MatrixMarket matrix coordinate intege
 %-------------------------------------------------------------------------------
 %-------------------------------------------------------------------------------
 )";
-
-
-
-
-
-
-
-
-
-
 
 
 struct indexedEdge {
@@ -1155,34 +792,54 @@ struct UnionFindStep {
 };
 
 parlay::sequence<edgeId> mst(wghEdgeArray<vertexId,edgeWeight> &E) { 
-  timer t("mst", true);
+  parlay::internal::timer t("mst", true);
   size_t m = E.m;
   size_t n = E.n;
   size_t k = std::min<size_t>(5 * n / 4, m);
 
   // equal edge weights will prioritize the earliest one
-  auto edgeLess = [&] (indexedEdge a, indexedEdge b) {
+  auto edgeLess = [&] (indexedEdge a, indexedEdge b) { 
     return (a.w < b.w) || ((a.w == b.w) && (a.id < b.id));};
 
   // tag each edge with an index
   auto IW = parlay::delayed_seq<indexedEdge>(m, [&] (size_t i) {
       return indexedEdge(E[i].u, E[i].v, i, E[i].weight);});
 
-  auto IW1 = parlay::sort(IW, edgeLess);
-  t.next("sort edges");
+  indexedEdge kth = pbbs::approximate_kth_smallest(IW, k, edgeLess);
+  t.next("approximate kth smallest");
+  
+  auto IW1 = parlay::filter(IW, [&] (indexedEdge e) {
+      return edgeLess(e, kth);}); //edgeLess(e, kth);});
+  t.next("filter those less than kth smallest as prefix");
+  
+  parlay::sort_inplace(IW1, edgeLess);
+  t.next("sort prefix");
 
   parlay::sequence<bool> mstFlags(m, false);
   unionFind<vertexId> UF(n);
   parlay::sequence<reservation> R(n);
   UnionFindStep UFStep1(IW1, UF, R,  mstFlags);
-  pbbs::speculative_for<vertexId>(UFStep1, 0, IW1.size(), 20, false);
-  t.next("union find loop");
+  pbbs::speculative_for<vertexId>(UFStep1, 0, IW1.size(), 5, false);
+  t.next("union find loop on prefix");
 
-  parlay::sequence<edgeId> mst = parlay::pack_index<edgeId>(mstFlags);
+  auto IW2 = parlay::filter(IW, [&] (indexedEdge e) {
+      return !edgeLess(e, kth) && UF.find(e.u) != UF.find(e.v);});
+  t.next("filter those that are not self edges");
+  
+  parlay::sort_inplace(IW2, edgeLess);
+  t.next("sort remaining");
+
+  UnionFindStep UFStep2(IW2, UF, R, mstFlags);
+  pbbs::speculative_for<vertexId>(UFStep2, 0, IW2.size(), 5, false);
+  t.next("union find loop on remaining");
+
+  parlay::sequence<edgeId> mst = parlay::internal::pack_index<edgeId>(mstFlags);
   t.next("pack out results");
 
+  //cout << "n=" << n << " m=" << m << " nInMst=" << size << endl;
   return mst;
 }
+
 
 // Helper function to convert edge* to parlay::sequence<wghEdge>
 parlay::sequence<wghEdge<vertexId, vertexId>> convert_to_wghEdges(const edge_pbbs* edges, size_t num_edges) {
@@ -1235,3 +892,147 @@ edge* cpu_compute_pbbs(size_t &num_edges_mst, wghEdgeArray<vertexId, vertexId> e
       edge* mst_array = get_mst_edges_as_array(edge_array, pbbs_res_mst, num_edges_mst);
       return mst_array;
 }
+
+void mmapPopulateEdgeArray(const std::string& filename, edge *edges, vertex num_edges, vertex num_nodes, bool generate_random_weights=false) {
+  std::cout << "Starting memory-mapped file loading..." << std::endl;
+  
+  // Open the file
+  int fd = open(filename.c_str(), O_RDONLY);
+  if (fd == -1) {
+    std::cerr << "Error opening file for memory mapping: " << strerror(errno) << std::endl;
+    return;
+  }
+  
+  // Get file size
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+    std::cerr << "Error getting file stats: " << strerror(errno) << std::endl;
+    close(fd);
+    return;
+  }
+  
+  // Map the file into memory
+  char* file_data = (char*)mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (file_data == MAP_FAILED) {
+    std::cerr << "Error memory mapping file: " << strerror(errno) << std::endl;
+    close(fd);
+    return;
+  }
+  
+  std::cout << "File mapped successfully, size: " << sb.st_size << " bytes" << std::endl;
+  std::cout << "Processing " << num_edges << " edges for " << num_nodes << " nodes" << std::endl;
+  
+  // Find the start of the data (after header comments and dimensions line)
+  char* data_start = file_data;
+  char* file_end = file_data + sb.st_size;
+  
+  // Skip comment lines (starting with %)
+  while (data_start < file_end && *data_start == '%') {
+    // Skip to end of line
+    while (data_start < file_end && *data_start != '\n') {
+      data_start++;
+    }
+    // Skip the newline character
+    if (data_start < file_end) data_start++;
+  }
+  
+  // Skip the dimensions line (first non-comment line)
+  while (data_start < file_end && *data_start != '\n') {
+    data_start++;
+  }
+  if (data_start < file_end) data_start++; // Skip the newline
+  
+  std::cout << "Header skipped, starting to process edge data" << std::endl;
+  
+  // Count the number of newlines to determine line positions
+  std::vector<char*> line_starts;
+  line_starts.reserve(num_edges);
+  
+  char* current = data_start;
+  line_starts.push_back(current);
+  
+  while (current < file_end) {
+    if (*current == '\n') {
+      if (current + 1 < file_end) {
+        line_starts.push_back(current + 1);
+      }
+    }
+    current++;
+  }
+  
+  // Make sure we don't try to process more lines than we have
+  size_t actual_lines = std::min(line_starts.size(), static_cast<size_t>(num_edges));
+  
+  std::cout << "Found " << actual_lines << " data lines" << std::endl;
+  
+  // Process the edge data in parallel
+  #pragma omp parallel for schedule(dynamic, 1024)
+  for (vertex i = 0; i < actual_lines; i++) {
+    if (i >= num_edges) continue;
+    
+    char* line = line_starts[i];
+    char* next_line = (i < line_starts.size() - 1) ? line_starts[i + 1] : file_end;
+    size_t line_length = next_line - line - 1; // -1 to exclude newline
+    
+    // Skip empty lines
+    if (line_length <= 0) continue;
+    
+    // Parse the line
+    vertex u = 0, v = 0;
+    weight w = 0;
+    
+    // Parse u
+    while (line < next_line && (*line == ' ' || *line == '\t')) line++; // Skip leading whitespace
+    while (line < next_line && *line >= '0' && *line <= '9') {
+      u = u * 10 + (*line - '0');
+      line++;
+    }
+    
+    // Skip whitespace
+    while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+    
+    // Parse v
+    while (line < next_line && *line >= '0' && *line <= '9') {
+      v = v * 10 + (*line - '0');
+      line++;
+    }
+    
+    // Parse or generate w
+    if (generate_random_weights) {
+      w = ((u-1)*(v-1)%num_nodes) + 1;
+    } else {
+      // Skip whitespace
+      while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+      
+      // Parse w
+      while (line < next_line && *line >= '0' && *line <= '9') {
+        w = w * 10 + (*line - '0');
+        line++;
+      }
+    }
+    
+    // Store the edge
+    if(u > v){
+      edges[i].u = v - 1;
+      edges[i].v = u - 1;
+    } else {
+      edges[i].u = u - 1;
+      edges[i].v = v - 1;
+    }
+    edges[i].w = w;
+    
+    // Progress indicator (only from main thread)
+    if (i % 1000000 == 0 && omp_get_thread_num() == 0) {
+      std::cout << "Processed " << i << " edges (" 
+                << (i * 100.0 / num_edges) << "%)" << std::endl;
+    }
+  }
+  
+  // Clean up
+  munmap(file_data, sb.st_size);
+  close(fd);
+  
+  std::cout << "Memory-mapped file processing complete" << std::endl;
+}
+
+#endif // UTILS_CU

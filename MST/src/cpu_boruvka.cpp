@@ -16,7 +16,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <execution>
-#include "constants.cpp"
+#include "constants.h"
 #include <chrono> 
 
 
@@ -566,7 +566,7 @@ int main(int argc, char* argv[]){
   vertex num_nodes, num_edges, number_of_filled_edges;
   getGraphInfo(file, num_nodes, num_edges);
   edge *edges = (edge *)malloc(num_edges*sizeof(edge));
-  readGraph(edges, num_nodes, num_edges, file, generate_random_weight);
+  fastPopulateEdgeArray(file, edges, num_edges, num_nodes, generate_random_weight);
   edge *final_msf = (edge *)malloc(num_nodes*sizeof(edge));
 
   //for(int i=0; i<num_edges; i++){

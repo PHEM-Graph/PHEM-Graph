@@ -8,17 +8,6 @@ std::condition_variable cv;
 // Shared variable
 vertex x = 0;
 
-__device__ void find_min_weighted_edge_id(outgoing_edge_id *existing_id, weight new_weight, vertex tid){
-    //AtomicMin to replace the existing edge weight with the new edge weight if the new edge weight is smaller
-  atomicMin(&existing_id->w, new_weight);
-  __threadfence();
-  //Make sure that the existing weight matches the new weight
-  if(existing_id->w == new_weight){
-      atomicExch(&existing_id->e_id, tid);
-  }
-
-  return;
-}
 
 __device__ void atomic_min_weight(outgoing_edge_id *existing_id, weight new_weight){
   atomicMin(&existing_id->w, new_weight);
@@ -44,8 +33,12 @@ __global__ void populate_min_weight(edge* d_edges,
     }
     vertex tid_v = tid_e.v;
     weight tid_w = tid_e.w;
-    atomic_min_weight(&d_best_index[tid_u], tid_w);
-    atomic_min_weight(&d_best_index[tid_v], tid_w);
+    if(d_best_index[tid_u].w > tid_w){
+      atomic_min_weight(&d_best_index[tid_u], tid_w);
+    }
+    if(d_best_index[tid_v].w > tid_w){
+      atomic_min_weight(&d_best_index[tid_v], tid_w);
+    }
 
   }
 }
@@ -64,10 +57,10 @@ __global__ void populate_eid(edge* d_edges,
     weight tid_w = tid_e.w;
     weight u_best_w = d_best_index[tid_u].w;
     weight v_best_w = d_best_index[tid_v].w;
-    if(tid_w == u_best_w){
+    if(tid_w == u_best_w && d_best_index[tid_u].e_id > tid){
       atomic_min_eid(&d_best_index[tid_u], tid);
     }
-    if(tid_w == v_best_w){
+    if(tid_w == v_best_w && d_best_index[tid_v].e_id > tid){
       atomic_min_eid(&d_best_index[tid_v], tid);
     }
     return;
@@ -857,7 +850,7 @@ void streamline_boruvka(std::ifstream &input_stream, vertex num_nodes,
                         large_vertex num_edges, vertex chunk_size, 
                         std::string result_filename="res.txt",
                         bool generate_random_weights=false, bool is_weight_float=false,
-                        int debug=1){
+                        int execution_time_iterations=1){
 
   std::cout << "streamline chunk boruvka " << std::endl;
   int num_chunks = (num_edges + chunk_size - 1)/chunk_size;
@@ -883,7 +876,7 @@ void streamline_boruvka(std::ifstream &input_stream, vertex num_nodes,
       chunk_size, last_chunk_size, num_chunks, generate_random_weights, is_weight_float);
 
   std::vector<int> execution_times;
-  for(int loops=0; loops<debug; loops++){
+  for(int loops=0; loops<execution_time_iterations; loops++){
     edge *final_msf;// = (edge *)malloc(num_nodes*sizeof(edge));
     cudaMallocHost((void**)&final_msf, num_nodes*sizeof(edge));
 
@@ -1160,12 +1153,11 @@ void streamline_boruvka(std::ifstream &input_stream, vertex num_nodes,
   return;
 }
 
-
 void streamline_boruvka_heterogeneous(std::ifstream &input_stream, vertex num_nodes, 
                           large_vertex num_edges, vertex chunk_size, 
                           std::string result_filename="res.txt",
                           bool generate_random_weights=false, 
-                          bool is_weight_float=false, int debug=1){
+                          bool is_weight_float=false, int execution_time_iterations=1){
 
   std::cout << "streamline heterogeneous boruvka " << std::endl;
   std::cout << num_edges << std::endl;
@@ -1190,11 +1182,248 @@ void streamline_boruvka_heterogeneous(std::ifstream &input_stream, vertex num_no
 
   edge *cpu_msf;
   cudaMallocHost((void**)&cpu_msf, (num_nodes-1)*sizeof(edge));
-  //populate the 2d array of edges
-  std::cout << "generating random weights " << generate_random_weights << std::endl;
-  populateEdgeChunks(input_stream, chunk_edges, num_edges, num_nodes,
-      chunk_size, last_chunk_size, num_chunks, generate_random_weights, is_weight_float);
-  std::cout << "populated edge chunks\n";
+  
+  // Get the filename from the input stream
+  std::string temp_filename = "temp_mmap_file.txt";
+  
+  // Save current position in the file
+  std::streampos current_pos = input_stream.tellg();
+  
+  // Rewind to beginning
+  input_stream.seekg(0, std::ios::beg);
+  
+  // Create a temporary file with the same content
+  std::ofstream temp_file(temp_filename, std::ios::binary);
+  if (!temp_file) {
+      std::cerr << "Error creating temporary file for memory mapping" << std::endl;
+      return;
+  }
+  
+  // Copy content
+  temp_file << input_stream.rdbuf();
+  temp_file.close();
+  
+  // Restore original position
+  input_stream.seekg(current_pos);
+  
+  // Now open the temporary file for memory mapping
+  int fd = open(temp_filename.c_str(), O_RDONLY);
+  if (fd == -1) {
+      std::cerr << "Error opening temporary file for memory mapping: " << strerror(errno) << std::endl;
+      return;
+  }
+  
+  // Get file size
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+      std::cerr << "Error getting file stats: " << strerror(errno) << std::endl;
+      close(fd);
+      return;
+  }
+  
+  // Map the file into memory
+  char* file_data = (char*)mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (file_data == MAP_FAILED) {
+      std::cerr << "Error memory mapping file: " << strerror(errno) << std::endl;
+      close(fd);
+      return;
+  }
+  
+  std::cout << "File mapped successfully, size: " << sb.st_size << " bytes" << std::endl;
+  std::cout << "Processing " << num_edges << " edges for " << num_nodes << " nodes" << std::endl;
+  
+  // Find the start of the data (after header comments and dimensions line)
+  char* data_start = file_data;
+  char* file_end = file_data + sb.st_size;
+  
+  // Skip comment lines (starting with %)
+  while (data_start < file_end && *data_start == '%') {
+      // Skip to end of line
+      while (data_start < file_end && *data_start != '\n') {
+          data_start++;
+      }
+      // Skip the newline character
+      if (data_start < file_end) data_start++;
+  }
+  
+  // Skip the dimensions line (first non-comment line)
+  while (data_start < file_end && *data_start != '\n') {
+      data_start++;
+  }
+  if (data_start < file_end) data_start++; // Skip the newline
+  
+  std::cout << "Header skipped, starting to process edge chunks" << std::endl;
+  
+  // Count the number of newlines to determine line positions
+  std::vector<char*> line_starts;
+  line_starts.reserve(num_edges);
+  
+  char* current = data_start;
+  line_starts.push_back(current);
+  
+  while (current < file_end) {
+      if (*current == '\n') {
+          if (current + 1 < file_end) {
+              line_starts.push_back(current + 1);
+          }
+      }
+      current++;
+  }
+  
+  // Make sure we don't try to process more lines than we have
+  size_t actual_lines = std::min(line_starts.size(), static_cast<size_t>(num_edges));
+  
+  std::cout << "Found " << actual_lines << " data lines" << std::endl;
+  
+  // Process the edge data for each chunk
+  #pragma omp parallel
+  {
+      // Process each chunk except the last one
+      #pragma omp for schedule(dynamic, 1)
+      for (int chunk_idx = 0; chunk_idx < num_chunks - 1; chunk_idx++) {
+          vertex chunk_start = chunk_idx * chunk_size;
+          
+          // Process each edge in the chunk
+          #pragma omp parallel for schedule(dynamic, 1024)
+          for (vertex i = 0; i < chunk_size; i++) {
+              large_vertex edge_idx = chunk_start + i;
+              if (edge_idx >= actual_lines) continue;
+              
+              char* line = line_starts[edge_idx];
+              char* next_line = (edge_idx < line_starts.size() - 1) ? line_starts[edge_idx + 1] : file_end;
+              size_t line_length = next_line - line - 1; // -1 to exclude newline
+              
+              // Skip empty lines
+              if (line_length <= 0) continue;
+              
+              // Parse the line
+              vertex u = 0, v = 0;
+              weight w = 0;
+              
+              // Parse u
+              while (line < next_line && (*line == ' ' || *line == '\t')) line++; // Skip leading whitespace
+              while (line < next_line && *line >= '0' && *line <= '9') {
+                  u = u * 10 + (*line - '0');
+                  line++;
+              }
+              
+              // Skip whitespace
+              while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+              
+              // Parse v
+              while (line < next_line && *line >= '0' && *line <= '9') {
+                  v = v * 10 + (*line - '0');
+                  line++;
+              }
+              
+              // Parse or generate w
+              if (generate_random_weights && !is_weight_float) {
+                  w = ((u-1)*(v-1)%num_nodes) + 1;
+              } else if (generate_random_weights && is_weight_float) {
+                  // Skip whitespace to discard float weight
+                  while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                  
+                  // Skip over the float value
+                  while (line < next_line && ((*line >= '0' && *line <= '9') || *line == '.' || *line == 'e' || *line == 'E' || *line == '+' || *line == '-')) {
+                      line++;
+                  }
+                  
+                  w = ((u-1)*(v-1)%num_nodes) + 1;
+              } else {
+                  // Skip whitespace
+                  while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                  
+                  // Parse w
+                  while (line < next_line && *line >= '0' && *line <= '9') {
+                      w = w * 10 + (*line - '0');
+                      line++;
+                  }
+              }
+              
+              // Store the edge
+              chunk_edges[chunk_idx][i].u = u - 1;
+              chunk_edges[chunk_idx][i].v = v - 1;
+              chunk_edges[chunk_idx][i].w = w;
+          }
+      }
+      
+      // Process the last chunk separately (it might have a different size)
+      #pragma omp single
+      {
+          vertex chunk_start = (num_chunks - 1) * chunk_size;
+          
+          #pragma omp parallel for schedule(dynamic, 1024)
+          for (vertex i = 0; i < last_chunk_size; i++) {
+              large_vertex edge_idx = chunk_start + i;
+              if (edge_idx >= actual_lines) continue;
+              
+              char* line = line_starts[edge_idx];
+              char* next_line = (edge_idx < line_starts.size() - 1) ? line_starts[edge_idx + 1] : file_end;
+              size_t line_length = next_line - line - 1; // -1 to exclude newline
+              
+              // Skip empty lines
+              if (line_length <= 0) continue;
+              
+              // Parse the line
+              vertex u = 0, v = 0;
+              weight w = 0;
+              
+              // Parse u
+              while (line < next_line && (*line == ' ' || *line == '\t')) line++; // Skip leading whitespace
+              while (line < next_line && *line >= '0' && *line <= '9') {
+                  u = u * 10 + (*line - '0');
+                  line++;
+              }
+              
+              // Skip whitespace
+              while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+              
+              // Parse v
+              while (line < next_line && *line >= '0' && *line <= '9') {
+                  v = v * 10 + (*line - '0');
+                  line++;
+              }
+              
+              // Parse or generate w
+              if (generate_random_weights && !is_weight_float) {
+                  w = ((u-1)*(v-1)%num_nodes) + 1;
+              } else if (generate_random_weights && is_weight_float) {
+                  // Skip whitespace to discard float weight
+                  while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                  
+                  // Skip over the float value
+                  while (line < next_line && ((*line >= '0' && *line <= '9') || *line == '.' || *line == 'e' || *line == 'E' || *line == '+' || *line == '-')) {
+                      line++;
+                  }
+                  
+                  w = ((u-1)*(v-1)%num_nodes) + 1;
+              } else {
+                  // Skip whitespace
+                  while (line < next_line && (*line == ' ' || *line == '\t')) line++;
+                  
+                  // Parse w
+                  while (line < next_line && *line >= '0' && *line <= '9') {
+                      w = w * 10 + (*line - '0');
+                      line++;
+                  }
+              }
+              
+              // Store the edge
+              chunk_edges[num_chunks-1][i].u = u - 1;
+              chunk_edges[num_chunks-1][i].v = v - 1;
+              chunk_edges[num_chunks-1][i].w = w;
+          }
+      }
+  }
+  
+  // Clean up memory mapping
+  munmap(file_data, sb.st_size);
+  close(fd);
+  
+  // Remove the temporary file
+  std::remove(temp_filename.c_str());
+  
+  std::cout << "Memory-mapped file processing for edge chunks complete" << std::endl;
 
   //Swap the first last_chunk_size edges with the last chunk
   #pragma omp parallel for
@@ -1214,6 +1443,7 @@ void streamline_boruvka_heterogeneous(std::ifstream &input_stream, vertex num_no
 
   edge *final_msf;// = (edge *)malloc(num_nodes*sizeof(edge));
   cudaMallocHost((void**)&final_msf, num_nodes*sizeof(edge));
+
   //DeviceMallocs start
   //Malloc edge array on device
   edge *d_edges;
@@ -1527,9 +1757,9 @@ void streamline_boruvka_heterogeneous(std::ifstream &input_stream, vertex num_no
 
       #pragma omp parallel for
       for(vertex j=0; j<total_offset; j++){
-	chunk_edges[num_chunks-1][j].u = edges_final_after_pbbs_filter[j].u;
-	chunk_edges[num_chunks-1][j].v = edges_final_after_pbbs_filter[j].v;
-	chunk_edges[num_chunks-1][j].w = edges_final_after_pbbs_filter[j].w;
+	      chunk_edges[num_chunks-1][j].u = edges_final_after_pbbs_filter[j].u;
+	      chunk_edges[num_chunks-1][j].v = edges_final_after_pbbs_filter[j].v;
+	      chunk_edges[num_chunks-1][j].w = edges_final_after_pbbs_filter[j].w;
       }
 
       auto stop_aux_copy= std::chrono::high_resolution_clock::now();
