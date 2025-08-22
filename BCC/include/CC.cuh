@@ -1,1 +1,0 @@
-float CC(struct graph_data*, int);
